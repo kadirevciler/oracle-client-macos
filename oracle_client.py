@@ -50,6 +50,90 @@ COMMENT_RE = re.compile(r"--[^\n]*|/\*.*?\*/", re.DOTALL)
 NUMBER_RE = re.compile(r"\b\d+(\.\d+)?\b")
 WORD_RE = re.compile(r"[A-Za-z0-9_$#]+$")
 
+EDITOR_FONT = ("Menlo", 13)
+
+
+class QueryTab:
+    """Bir sorgu sekmesi: SQL editörü + sonuç grid'i + kendi sonucu/dosyası."""
+
+    def __init__(self, app, notebook, title):
+        self.app = app
+        self.title = title
+        self.script_path = None
+        self.last_columns = None
+        self.last_rows = None
+
+        self.frame = ttk.Frame(notebook)
+        paned = ttk.PanedWindow(self.frame, orient=tk.VERTICAL)
+        paned.pack(fill=tk.BOTH, expand=True)
+
+        editor_body = ttk.Frame(paned)
+        paned.add(editor_body, weight=1)
+        self.sql_text = tk.Text(editor_body, height=8, wrap=tk.NONE,
+                                font=EDITOR_FONT, undo=True,
+                                background="#ffffff", foreground="#1f1f1f",
+                                insertbackground="#1f1f1f")
+        sql_scroll = ttk.Scrollbar(editor_body, orient=tk.VERTICAL,
+                                   command=self.sql_text.yview)
+        self.sql_text.configure(yscrollcommand=sql_scroll.set)
+        sql_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.sql_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        self.sql_text.tag_configure("kw", foreground="#0033b3",
+                                    font=EDITOR_FONT + ("bold",))
+        self.sql_text.tag_configure("num", foreground="#a34a00")
+        self.sql_text.tag_configure("str", foreground="#067d17")
+        self.sql_text.tag_configure("com", foreground="#8c8c8c",
+                                    font=EDITOR_FONT + ("italic",))
+
+        self.sql_text.bind("<Command-Return>", lambda e: (app.run_query(), "break")[1])
+        self.sql_text.bind("<F5>", lambda e: (app.run_query(), "break")[1])
+        self.sql_text.bind("<Command-s>", lambda e: (app.save_script(), "break")[1])
+        self.sql_text.bind("<Command-o>", lambda e: (app.open_script(), "break")[1])
+        self.sql_text.bind("<Control-space>", app._force_autocomplete)
+        self.sql_text.bind("<KeyPress>", app._on_editor_keypress)
+        self.sql_text.bind("<KeyRelease>", app._on_editor_keyrelease)
+        self.sql_text.bind("<Button-1>", lambda e: app._hide_autocomplete())
+
+        grid_frame = ttk.Frame(paned)
+        paned.add(grid_frame, weight=3)
+        self.grid = ttk.Treeview(grid_frame, show="headings", selectmode="extended")
+        grid_y = ttk.Scrollbar(grid_frame, orient=tk.VERTICAL, command=self.grid.yview)
+        grid_x = ttk.Scrollbar(grid_frame, orient=tk.HORIZONTAL, command=self.grid.xview)
+        self.grid.configure(yscrollcommand=grid_y.set, xscrollcommand=grid_x.set)
+        grid_y.pack(side=tk.RIGHT, fill=tk.Y)
+        grid_x.pack(side=tk.BOTTOM, fill=tk.X)
+        self.grid.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        notebook.add(self.frame, text=title)
+
+    def set_sql(self, sql):
+        self.sql_text.delete("1.0", tk.END)
+        self.sql_text.insert("1.0", sql)
+        self.app._highlight(self.sql_text)
+
+    def get_sql(self):
+        return self.sql_text.get("1.0", tk.END).strip().rstrip(";")
+
+    def clear_grid(self):
+        self.grid.delete(*self.grid.get_children())
+        self.grid.configure(columns=())
+        self.last_columns = None
+        self.last_rows = None
+
+    def show_rows(self, columns, rows):
+        self.clear_grid()
+        self.grid.configure(columns=columns)
+        for col in columns:
+            self.grid.heading(col, text=col)
+            width = max(80, min(300, len(col) * 10 + 20))
+            self.grid.column(col, width=width, stretch=False)
+        for row in rows:
+            display = ["(null)" if v is None else str(v) for v in row]
+            self.grid.insert("", tk.END, values=display)
+        self.last_columns = columns
+        self.last_rows = rows
+
 
 class OracleClientApp:
     def __init__(self, root: tk.Tk):
@@ -64,13 +148,13 @@ class OracleClientApp:
         self.schemas = []               # tüm şema adları
         self.schema_objects = {}        # şema -> [(tip, ad)] (lazy yüklenir)
         self.open_schemas = set()       # ağaçta açık şemalar
+        self.pending_loads = []         # yenileme sonrası sırayla yüklenecek şemalar
         self.known_objects = {}         # NESNE_ADI -> şema (intellisense için)
         self.columns_cache = {}         # NESNE_ADI -> [kolonlar]
         self.completions = set(SQL_KEYWORDS)
 
-        self.last_columns = None        # CSV export için son sonuç
-        self.last_rows = None
-        self.script_path = None         # açık betik dosyası
+        self.tabs = []                  # QueryTab listesi
+        self.tab_counter = 0
         self._hl_job = None             # renklendirme debounce
         self.profiles = self._load_json(PROFILES_FILE, {})
 
@@ -78,6 +162,11 @@ class OracleClientApp:
         self._build_main_area()
         self._build_status_bar()
         self._build_autocomplete()
+
+        self.new_tab()                  # ilk boş sekme
+
+        self.root.bind("<Command-t>", lambda e: self.new_tab())
+        self.root.bind("<Command-w>", lambda e: self.close_current_tab())
 
         self.root.after(100, self._poll_queue)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -87,6 +176,53 @@ class OracleClientApp:
         self.root.attributes("-topmost", True)
         self.root.after(300, lambda: self.root.attributes("-topmost", False))
         self.root.focus_force()
+
+    # ---------------------------------------------------- Sekme yönetimi
+
+    @property
+    def sql_text(self):
+        return self.current_tab().sql_text
+
+    def current_tab(self) -> QueryTab:
+        sel = self.query_nb.select()
+        for tab in self.tabs:
+            if str(tab.frame) == sel:
+                return tab
+        return self.tabs[0]
+
+    def new_tab(self, sql="", title=None):
+        self.tab_counter += 1
+        title = title or f"Sorgu {self.tab_counter}"
+        tab = QueryTab(self, self.query_nb, title)
+        self.tabs.append(tab)
+        if sql:
+            tab.set_sql(sql)
+        self.query_nb.select(tab.frame)
+        tab.sql_text.focus_set()
+        return tab
+
+    def close_current_tab(self):
+        tab = self.current_tab()
+        if len(self.tabs) == 1:
+            # son sekme kapanmaz, içeriği temizlenir
+            tab.set_sql("")
+            tab.clear_grid()
+            tab.script_path = None
+            self.query_nb.tab(tab.frame, text=tab.title)
+            self._update_export_btn()
+            return
+        self.query_nb.forget(tab.frame)
+        self.tabs.remove(tab)
+        self._update_export_btn()
+
+    def _rename_tab(self, tab, title):
+        tab.title = title
+        self.query_nb.tab(tab.frame, text=title)
+
+    def _update_export_btn(self, *_):
+        tab = self.current_tab() if self.tabs else None
+        state = tk.NORMAL if tab and tab.last_columns else tk.DISABLED
+        self.export_btn.configure(state=state)
 
     # ------------------------------------------------------------------ UI
 
@@ -159,10 +295,16 @@ class OracleClientApp:
         left_nb.add(hist_tab, text="Tarihçe")
         self._build_history_tab(hist_tab)
 
+        top_row = ttk.Frame(left)
+        top_row.pack(fill=tk.X, pady=(0, 4))
+        self.refresh_btn = ttk.Button(top_row, text="⟳ Yenile",
+                                      command=self.refresh_objects,
+                                      state=tk.DISABLED)
+        self.refresh_btn.pack(side=tk.RIGHT)
         self.filter_var = tk.StringVar()
         self.filter_var.trace_add("write", lambda *a: self._apply_filter())
-        filter_entry = ttk.Entry(left, textvariable=self.filter_var)
-        filter_entry.pack(fill=tk.X, pady=(0, 4))
+        filter_entry = ttk.Entry(top_row, textvariable=self.filter_var)
+        filter_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
         self._add_placeholder(filter_entry, "Filtrele...")
 
         tree_frame = ttk.Frame(left)
@@ -178,76 +320,41 @@ class OracleClientApp:
         self.obj_tree.bind("<<TreeviewOpen>>", self._on_tree_expand)
         self.obj_tree.bind("<<TreeviewClose>>", self._on_tree_collapse)
 
-        # ---- Sağ panel: SQL editörü + sonuç grid'i
-        right = ttk.PanedWindow(outer, orient=tk.VERTICAL)
+        # ---- Sağ panel: araç çubuğu + sorgu sekmeleri
+        right = ttk.Frame(outer)
         outer.add(right, weight=4)
 
-        editor_frame = ttk.Frame(right)
-        right.add(editor_frame, weight=1)
-
-        editor_top = ttk.Frame(editor_frame)
-        editor_top.pack(fill=tk.X, pady=(0, 2))
-        self.run_btn = ttk.Button(editor_top, text="▶ Çalıştır (⌘↩)",
+        toolbar = ttk.Frame(right)
+        toolbar.pack(fill=tk.X, pady=(0, 2))
+        self.run_btn = ttk.Button(toolbar, text="▶ Çalıştır (⌘↩)",
                                   command=self.run_query, state=tk.DISABLED)
         self.run_btn.pack(side=tk.LEFT)
-        ttk.Separator(editor_top, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
-        ttk.Button(editor_top, text="📂 Aç",
+        ttk.Separator(toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
+        ttk.Button(toolbar, text="＋ Yeni Sekme (⌘T)",
+                   command=lambda: self.new_tab()).pack(side=tk.LEFT, padx=2)
+        ttk.Button(toolbar, text="✕ Sekmeyi Kapat (⌘W)",
+                   command=self.close_current_tab).pack(side=tk.LEFT, padx=2)
+        ttk.Separator(toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
+        ttk.Button(toolbar, text="📂 Aç",
                    command=self.open_script).pack(side=tk.LEFT, padx=2)
-        ttk.Button(editor_top, text="💾 Kaydet (⌘S)",
+        ttk.Button(toolbar, text="💾 Kaydet (⌘S)",
                    command=self.save_script).pack(side=tk.LEFT, padx=2)
-        ttk.Button(editor_top, text="Farklı Kaydet",
+        ttk.Button(toolbar, text="Farklı Kaydet",
                    command=lambda: self.save_script(save_as=True)).pack(side=tk.LEFT, padx=2)
-        ttk.Separator(editor_top, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
-        self.export_btn = ttk.Button(editor_top, text="⬇ CSV'ye Aktar",
+        ttk.Separator(toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
+        self.export_btn = ttk.Button(toolbar, text="⬇ CSV'ye Aktar",
                                      command=self.export_csv, state=tk.DISABLED)
         self.export_btn.pack(side=tk.LEFT, padx=2)
-        ttk.Label(editor_top, text=f"  ^Space: tamamlama — ilk {MAX_QUERY_ROWS} satır"
-                  ).pack(side=tk.LEFT)
 
-        editor_body = ttk.Frame(editor_frame)
-        editor_body.pack(fill=tk.BOTH, expand=True)
-        self.sql_text = tk.Text(editor_body, height=8, wrap=tk.NONE,
-                                font=("Menlo", 13), undo=True,
-                                background="#ffffff", foreground="#1f1f1f",
-                                insertbackground="#1f1f1f")
-        sql_scroll = ttk.Scrollbar(editor_body, orient=tk.VERTICAL,
-                                   command=self.sql_text.yview)
-        self.sql_text.configure(yscrollcommand=sql_scroll.set)
-        sql_scroll.pack(side=tk.RIGHT, fill=tk.Y)
-        self.sql_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-
-        # renklendirme etiketleri
-        self.sql_text.tag_configure("kw", foreground="#0033b3", font=("Menlo", 13, "bold"))
-        self.sql_text.tag_configure("num", foreground="#a34a00")
-        self.sql_text.tag_configure("str", foreground="#067d17")
-        self.sql_text.tag_configure("com", foreground="#8c8c8c",
-                                    font=("Menlo", 13, "italic"))
-
-        self.sql_text.bind("<Command-Return>", lambda e: (self.run_query(), "break")[1])
-        self.sql_text.bind("<F5>", lambda e: (self.run_query(), "break")[1])
-        self.sql_text.bind("<Command-s>", lambda e: (self.save_script(), "break")[1])
-        self.sql_text.bind("<Command-o>", lambda e: (self.open_script(), "break")[1])
-        self.sql_text.bind("<Control-space>", self._force_autocomplete)
-        self.sql_text.bind("<KeyPress>", self._on_editor_keypress)
-        self.sql_text.bind("<KeyRelease>", self._on_editor_keyrelease)
-        self.sql_text.bind("<Button-1>", lambda e: self._hide_autocomplete())
-
-        grid_frame = ttk.Frame(right)
-        right.add(grid_frame, weight=3)
-
-        self.grid = ttk.Treeview(grid_frame, show="headings", selectmode="extended")
-        grid_y = ttk.Scrollbar(grid_frame, orient=tk.VERTICAL, command=self.grid.yview)
-        grid_x = ttk.Scrollbar(grid_frame, orient=tk.HORIZONTAL, command=self.grid.xview)
-        self.grid.configure(yscrollcommand=grid_y.set, xscrollcommand=grid_x.set)
-        grid_y.pack(side=tk.RIGHT, fill=tk.Y)
-        grid_x.pack(side=tk.BOTTOM, fill=tk.X)
-        self.grid.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.query_nb = ttk.Notebook(right)
+        self.query_nb.pack(fill=tk.BOTH, expand=True)
+        self.query_nb.bind("<<NotebookTabChanged>>", self._update_export_btn)
 
     def _build_history_tab(self, parent):
         top = ttk.Frame(parent)
         top.pack(fill=tk.X, pady=(0, 4))
         ttk.Button(top, text="Temizle", command=self._clear_history).pack(side=tk.RIGHT)
-        ttk.Label(top, text="Çift tık: editöre yükle").pack(side=tk.LEFT)
+        ttk.Label(top, text="Çift tık: yeni sekmede aç").pack(side=tk.LEFT)
 
         frame = ttk.Frame(parent)
         frame.pack(fill=tk.BOTH, expand=True)
@@ -416,14 +523,15 @@ class OracleClientApp:
         self.connect_btn.configure(state=tk.NORMAL)
         self.disconnect_btn.configure(state=tk.DISABLED)
         self.run_btn.configure(state=tk.DISABLED)
+        self.refresh_btn.configure(state=tk.DISABLED)
         self.schemas = []
         self.schema_objects = {}
         self.open_schemas = set()
+        self.pending_loads = []
         self.known_objects = {}
         self.columns_cache = {}
         self.completions = set(SQL_KEYWORDS)
         self.obj_tree.delete(*self.obj_tree.get_children())
-        self._clear_grid()
         self._set_status("Bağlı değil")
 
     # ------------------------------------------------------ Nesne ağacı
@@ -437,6 +545,18 @@ class OracleClientApp:
             cur.close()
             return ("schemas", schemas)
         self._run_in_thread(work)
+
+    def refresh_objects(self):
+        """Şema listesini ve açık şemaların nesnelerini yeniden yükle."""
+        if self.conn is None or self.busy:
+            return
+        self.schema_objects = {}
+        self.known_objects = {}
+        self.columns_cache = {}
+        self.completions = set(SQL_KEYWORDS)
+        self.pending_loads = sorted(self.open_schemas)
+        self._set_status("Nesneler yenileniyor...")
+        self.load_schemas()
 
     def _load_schema_objects(self, schema):
         self._set_status(f"{schema} şemasındaki nesneler yükleniyor...")
@@ -530,23 +650,25 @@ class OracleClientApp:
             return
         _kind, schema, name = values
         sql = f'SELECT * FROM "{schema}"."{name}" WHERE ROWNUM <= {TABLE_PREVIEW_ROWS}'
-        self.sql_text.delete("1.0", tk.END)
-        self.sql_text.insert("1.0", sql)
-        self._highlight()
+        self.new_tab(sql=sql, title=name)
         self.run_query()
         self._fetch_columns(schema, name)
 
     # ------------------------------------------------------------- Sorgu
 
     def run_query(self):
-        if self.conn is None or self.busy:
+        if self.conn is None:
+            return
+        if self.busy:
+            self._set_status("Başka bir sorgu çalışıyor, bitmesini bekleyin...")
             return
         self._hide_autocomplete()
-        sql = self.sql_text.get("1.0", tk.END).strip().rstrip(";")
+        tab = self.current_tab()
+        sql = tab.get_sql()
         if not sql:
             return
         self._add_history(sql)
-        self._set_status("Sorgu çalışıyor...")
+        self._set_status(f"[{tab.title}] Sorgu çalışıyor...")
         self.run_btn.configure(state=tk.DISABLED)
 
         def work(conn):
@@ -559,44 +681,19 @@ class OracleClientApp:
                     affected = cur.rowcount
                     conn.commit()
                     elapsed = time.perf_counter() - start
-                    return ("dml_done", affected, elapsed)
+                    return ("dml_done", tab, affected, elapsed)
                 columns = [d[0] for d in cur.description]
                 rows = cur.fetchmany(MAX_QUERY_ROWS)
                 truncated = cur.fetchone() is not None
                 elapsed = time.perf_counter() - start
-                return ("rows", columns, rows, truncated, elapsed)
+                return ("rows", tab, columns, rows, truncated, elapsed)
             finally:
                 cur.close()
         self._run_in_thread(work)
 
-    # ------------------------------------------------------------- Grid
-
-    def _clear_grid(self):
-        self.grid.delete(*self.grid.get_children())
-        self.grid.configure(columns=())
-        self.last_columns = None
-        self.last_rows = None
-        self.export_btn.configure(state=tk.DISABLED)
-
-    def _show_rows(self, columns, rows):
-        self._clear_grid()
-        self.grid.configure(columns=columns)
-        for col in columns:
-            self.grid.heading(col, text=col)
-            width = max(80, min(300, len(col) * 10 + 20))
-            self.grid.column(col, width=width, stretch=False)
-        for row in rows:
-            display = ["(null)" if v is None else str(v) for v in row]
-            self.grid.insert("", tk.END, values=display)
-        self.last_columns = columns
-        self.last_rows = rows
-        if rows or columns:
-            self.export_btn.configure(state=tk.NORMAL)
-        # kolon adlarını tamamlama önerilerine ekle
-        self.completions.update(columns)
-
     def export_csv(self):
-        if not self.last_columns:
+        tab = self.current_tab()
+        if not tab.last_columns:
             return
         path = filedialog.asksaveasfilename(
             title="CSV olarak kaydet", defaultextension=".csv",
@@ -607,10 +704,10 @@ class OracleClientApp:
         try:
             with open(path, "w", newline="", encoding="utf-8-sig") as f:
                 writer = csv.writer(f, delimiter=";")
-                writer.writerow(self.last_columns)
-                for row in self.last_rows:
+                writer.writerow(tab.last_columns)
+                for row in tab.last_rows:
                     writer.writerow(["" if v is None else v for v in row])
-            self._set_status(f"{len(self.last_rows)} satır CSV'ye aktarıldı: {path}")
+            self._set_status(f"{len(tab.last_rows)} satır CSV'ye aktarıldı: {path}")
         except OSError as exc:
             messagebox.showerror("CSV hatası", str(exc))
 
@@ -629,32 +726,30 @@ class OracleClientApp:
         except OSError as exc:
             messagebox.showerror("Dosya hatası", str(exc))
             return
-        self.sql_text.delete("1.0", tk.END)
-        self.sql_text.insert("1.0", content)
-        self._highlight()
-        self.script_path = path
-        self.root.title(f"Oracle Client — {os.path.basename(path)}")
+        tab = self.new_tab(sql=content, title=os.path.basename(path))
+        tab.script_path = path
         self._set_status(f"Betik açıldı: {path}")
 
     def save_script(self, save_as=False):
-        if save_as or not self.script_path:
+        tab = self.current_tab()
+        if save_as or not tab.script_path:
             path = filedialog.asksaveasfilename(
                 title="SQL betiğini kaydet", defaultextension=".sql",
                 filetypes=[("SQL dosyası", "*.sql"), ("Tüm dosyalar", "*.*")],
-                initialfile=os.path.basename(self.script_path)
-                if self.script_path else "betik.sql",
+                initialfile=os.path.basename(tab.script_path)
+                if tab.script_path else "betik.sql",
                 parent=self.root)
             if not path:
                 return
-            self.script_path = path
+            tab.script_path = path
         try:
-            with open(self.script_path, "w", encoding="utf-8") as f:
-                f.write(self.sql_text.get("1.0", "end-1c"))
+            with open(tab.script_path, "w", encoding="utf-8") as f:
+                f.write(tab.sql_text.get("1.0", "end-1c"))
         except OSError as exc:
             messagebox.showerror("Dosya hatası", str(exc))
             return
-        self.root.title(f"Oracle Client — {os.path.basename(self.script_path)}")
-        self._set_status(f"Betik kaydedildi: {self.script_path}")
+        self._rename_tab(tab, os.path.basename(tab.script_path))
+        self._set_status(f"Betik kaydedildi: {tab.script_path}")
 
     # ----------------------------------------------- Sözdizimi renklendirme
 
@@ -663,23 +758,24 @@ class OracleClientApp:
             self.root.after_cancel(self._hl_job)
         self._hl_job = self.root.after(150, self._highlight)
 
-    def _highlight(self):
+    def _highlight(self, widget=None):
         self._hl_job = None
-        text = self.sql_text.get("1.0", "end-1c")
+        widget = widget or self.sql_text
+        text = widget.get("1.0", "end-1c")
         for tag in ("kw", "num", "str", "com"):
-            self.sql_text.tag_remove(tag, "1.0", tk.END)
+            widget.tag_remove(tag, "1.0", tk.END)
 
         def apply(tag, regex):
             for m in regex.finditer(text):
-                self.sql_text.tag_add(tag, f"1.0+{m.start()}c", f"1.0+{m.end()}c")
+                widget.tag_add(tag, f"1.0+{m.start()}c", f"1.0+{m.end()}c")
 
         apply("kw", KEYWORD_RE)
         apply("num", NUMBER_RE)
         apply("str", STRING_RE)
         apply("com", COMMENT_RE)
         # string ve yorum, anahtar kelime renginin üstünde kalsın
-        self.sql_text.tag_raise("str")
-        self.sql_text.tag_raise("com")
+        widget.tag_raise("str")
+        widget.tag_raise("com")
 
     # ----------------------------------------------------- Otomatik tamamlama
 
@@ -853,9 +949,7 @@ class OracleClientApp:
         if not item:
             return
         sql = self.history[int(item)]["sql"]
-        self.sql_text.delete("1.0", tk.END)
-        self.sql_text.insert("1.0", sql)
-        self._highlight()
+        self.new_tab(sql=sql)
 
     def _clear_history(self):
         if not self.history:
@@ -888,12 +982,22 @@ class OracleClientApp:
             pass
         self.root.after(100, self._poll_queue)
 
+    def _next_pending_load(self):
+        """Yenileme sonrası açık şemaları sırayla yeniden yükle."""
+        while self.pending_loads:
+            schema = self.pending_loads.pop(0)
+            if schema in self.schemas and self.schema_objects.get(schema) is None:
+                self._load_schema_objects(schema)
+                return True
+        return False
+
     def _handle_message(self, msg):
         kind = msg[0]
         if kind == "connected":
             self.conn = msg[1]
             self.disconnect_btn.configure(state=tk.NORMAL)
             self.run_btn.configure(state=tk.NORMAL)
+            self.refresh_btn.configure(state=tk.NORMAL)
             self._set_status(f"Bağlandı: {self.user_var.get()}@{self.host_var.get()}"
                              f":{self.port_var.get()}/{self.service_var.get()}")
             self.load_schemas()
@@ -906,12 +1010,15 @@ class OracleClientApp:
             self.schemas = msg[1]
             self.completions.update(self.schemas)
             self._render_tree()
-            # bağlanılan kullanıcının şemasını otomatik yükle
-            current_user = self.user_var.get().strip().upper()
-            if current_user in self.schemas:
-                self.open_schemas.add(current_user)
-                self._load_schema_objects(current_user)
-            self._set_status(f"{len(self.schemas)} şema listelendi")
+            if not self._next_pending_load():
+                # ilk bağlantı: kullanıcının kendi şemasını otomatik yükle
+                current_user = self.user_var.get().strip().upper()
+                if (current_user in self.schemas
+                        and self.schema_objects.get(current_user) is None):
+                    self.open_schemas.add(current_user)
+                    self._load_schema_objects(current_user)
+                else:
+                    self._set_status(f"{len(self.schemas)} şema listelendi")
         elif kind == "objects":
             self.busy = False
             _, schema, objs = msg
@@ -920,21 +1027,27 @@ class OracleClientApp:
                 self.known_objects[name] = schema
             self.completions.update(n for _t, n in objs)
             self._render_tree()
-            self._set_status(f"{schema}: {len(objs)} nesne listelendi")
+            if not self._next_pending_load():
+                self._set_status(f"{schema}: {len(objs)} nesne listelendi")
         elif kind == "rows":
             self.busy = False
-            _, columns, rows, truncated, elapsed = msg
-            self._show_rows(columns, rows)
+            _, tab, columns, rows, truncated, elapsed = msg
+            if tab in self.tabs:
+                tab.show_rows(columns, rows)
+                self.completions.update(columns)
             note = f" (ilk {MAX_QUERY_ROWS} satır gösteriliyor)" if truncated else ""
-            self._set_status(f"{len(rows)} satır — {elapsed:.2f} sn{note}")
+            self._set_status(f"[{tab.title}] {len(rows)} satır — {elapsed:.2f} sn{note}")
             self.run_btn.configure(state=tk.NORMAL)
+            self._update_export_btn()
         elif kind == "dml_done":
             self.busy = False
-            _, affected, elapsed = msg
-            self._clear_grid()
-            self._set_status(f"İfade çalıştı: {affected} satır etkilendi — "
-                             f"{elapsed:.2f} sn (commit edildi)")
+            _, tab, affected, elapsed = msg
+            if tab in self.tabs:
+                tab.clear_grid()
+            self._set_status(f"[{tab.title}] İfade çalıştı: {affected} satır etkilendi"
+                             f" — {elapsed:.2f} sn (commit edildi)")
             self.run_btn.configure(state=tk.NORMAL)
+            self._update_export_btn()
         elif kind == "columns":
             self.busy = False
             _, name, cols, show_popup = msg
@@ -944,6 +1057,7 @@ class OracleClientApp:
                 self._show_autocomplete(cols)
         elif kind == "error":
             self.busy = False
+            self.pending_loads = []
             self.run_btn.configure(state=tk.NORMAL if self.conn else tk.DISABLED)
             self._set_status("Hata")
             messagebox.showerror("Hata", msg[1])
