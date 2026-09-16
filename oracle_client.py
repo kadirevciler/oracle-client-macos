@@ -52,6 +52,9 @@ WORD_RE = re.compile(r"[A-Za-z0-9_$#]+$")
 
 EDITOR_FONT = ("Menlo", 13)
 
+OBJ_FILTER_PH = "Nesne adı filtrele..."
+DDL_SEARCH_PH = "DDL / kaynak içinde ara..."
+
 
 class QueryTab:
     """Bir sorgu sekmesi: SQL editörü + sonuç grid'i + kendi sonucu/dosyası."""
@@ -148,6 +151,7 @@ class OracleClientApp:
         self.schemas = []               # tüm şema adları
         self.schema_objects = {}        # şema -> [(tip, ad)] (lazy yüklenir)
         self.open_schemas = set()       # ağaçta açık şemalar
+        self.selected_schemas = set()   # çok-seçimli şema filtresi (boş = tümü)
         self.pending_loads = []         # yenileme sonrası sırayla yüklenecek şemalar
         self.known_objects = {}         # NESNE_ADI -> şema (intellisense için)
         self.columns_cache = {}         # NESNE_ADI -> [kolonlar]
@@ -295,17 +299,36 @@ class OracleClientApp:
         left_nb.add(hist_tab, text="Tarihçe")
         self._build_history_tab(hist_tab)
 
-        top_row = ttk.Frame(left)
-        top_row.pack(fill=tk.X, pady=(0, 4))
-        self.refresh_btn = ttk.Button(top_row, text="⟳ Yenile",
+        # Çok-seçimli şema filtresi + yenile
+        srow = ttk.Frame(left)
+        srow.pack(fill=tk.X, pady=(0, 4))
+        self.schema_btn = ttk.Button(srow, text="Şemalar ▾",
+                                     command=self._open_schema_picker,
+                                     state=tk.DISABLED)
+        self.schema_btn.pack(side=tk.LEFT)
+        self.refresh_btn = ttk.Button(srow, text="⟳ Yenile",
                                       command=self.refresh_objects,
                                       state=tk.DISABLED)
         self.refresh_btn.pack(side=tk.RIGHT)
+
+        # Nesne adı filtresi (ağaç)
         self.filter_var = tk.StringVar()
         self.filter_var.trace_add("write", lambda *a: self._apply_filter())
-        filter_entry = ttk.Entry(top_row, textvariable=self.filter_var)
-        filter_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
-        self._add_placeholder(filter_entry, "Filtrele...")
+        filter_entry = ttk.Entry(left, textvariable=self.filter_var)
+        filter_entry.pack(fill=tk.X, pady=(0, 4))
+        self._add_placeholder(filter_entry, OBJ_FILTER_PH)
+
+        # DDL / kaynak serbest metin arama
+        ddl_row = ttk.Frame(left)
+        ddl_row.pack(fill=tk.X, pady=(0, 4))
+        self.ddl_search_var = tk.StringVar()
+        ddl_entry = ttk.Entry(ddl_row, textvariable=self.ddl_search_var)
+        ddl_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
+        self._add_placeholder(ddl_entry, DDL_SEARCH_PH)
+        ddl_entry.bind("<Return>", lambda e: self.search_ddl())
+        self.ddl_btn = ttk.Button(ddl_row, text="🔍 DDL Ara",
+                                  command=self.search_ddl, state=tk.DISABLED)
+        self.ddl_btn.pack(side=tk.RIGHT)
 
         tree_frame = ttk.Frame(left)
         tree_frame.pack(fill=tk.BOTH, expand=True)
@@ -524,9 +547,13 @@ class OracleClientApp:
         self.disconnect_btn.configure(state=tk.DISABLED)
         self.run_btn.configure(state=tk.DISABLED)
         self.refresh_btn.configure(state=tk.DISABLED)
+        self.schema_btn.configure(state=tk.DISABLED)
+        self.ddl_btn.configure(state=tk.DISABLED)
         self.schemas = []
         self.schema_objects = {}
         self.open_schemas = set()
+        self.selected_schemas = set()
+        self._update_schema_btn()
         self.pending_loads = []
         self.known_objects = {}
         self.columns_cache = {}
@@ -558,6 +585,194 @@ class OracleClientApp:
         self._set_status("Nesneler yenileniyor...")
         self.load_schemas()
 
+    # ------------------------------------------------ Çok-seçimli şema filtresi
+
+    def _update_schema_btn(self):
+        n = len(self.selected_schemas)
+        self.schema_btn.configure(text=f"Şemalar ({n}) ▾" if n else "Şemalar ▾")
+
+    def _open_schema_picker(self):
+        if not self.schemas:
+            return
+        win = tk.Toplevel(self.root)
+        win.title("Şema seç")
+        win.geometry("320x460")
+        win.transient(self.root)
+
+        fv = tk.StringVar()
+        fe = ttk.Entry(win, textvariable=fv)
+        fe.pack(fill=tk.X, padx=8, pady=(8, 4))
+        self._add_placeholder(fe, "Şema ara...")
+
+        body = ttk.Frame(win)
+        body.pack(fill=tk.BOTH, expand=True, padx=(8, 0))
+        canvas = tk.Canvas(body, highlightthickness=0, width=1)
+        sb = ttk.Scrollbar(body, orient=tk.VERTICAL, command=canvas.yview)
+        inner = ttk.Frame(canvas)
+        inner.bind("<Configure>",
+                   lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=inner, anchor="nw")
+        canvas.configure(yscrollcommand=sb.set)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+
+        vars_map = {}
+
+        def rebuild(*_):
+            for w in inner.winfo_children():
+                w.destroy()
+            term = fv.get().strip()
+            if term == "Şema ara...":
+                term = ""
+            term = term.upper()
+            for s in self.schemas:
+                if term and term not in s.upper():
+                    continue
+                v = vars_map.get(s)
+                if v is None:
+                    v = tk.BooleanVar(value=(s in self.selected_schemas))
+                    vars_map[s] = v
+                ttk.Checkbutton(inner, text=s, variable=v).pack(anchor="w", pady=1)
+
+        fv.trace_add("write", rebuild)
+        rebuild()
+
+        btns = ttk.Frame(win)
+        btns.pack(fill=tk.X, padx=8, pady=8)
+
+        def set_all(val):
+            for s in self.schemas:
+                vars_map.setdefault(s, tk.BooleanVar()).set(val)
+            rebuild()
+
+        ttk.Button(btns, text="Tümü", command=lambda: set_all(True)).pack(side=tk.LEFT)
+        ttk.Button(btns, text="Hiçbiri", command=lambda: set_all(False)).pack(side=tk.LEFT, padx=4)
+
+        def apply():
+            self.selected_schemas = {s for s, v in vars_map.items() if v.get()}
+            self._update_schema_btn()
+            self._render_tree()
+            # yeni seçilen ve henüz yüklenmemiş şemaların nesnelerini çek
+            to_load = [s for s in sorted(self.selected_schemas)
+                       if self.schema_objects.get(s) is None
+                       and s not in self.pending_loads]
+            for s in to_load:
+                self.open_schemas.add(s)
+                self.pending_loads.append(s)
+            if self.pending_loads and not self.busy:
+                self._next_pending_load()
+            win.destroy()
+
+        ttk.Button(btns, text="Uygula", command=apply).pack(side=tk.RIGHT)
+        ttk.Button(btns, text="İptal", command=win.destroy).pack(side=tk.RIGHT, padx=4)
+
+        win.update_idletasks()
+        win.lift()
+        fe.focus_set()
+
+    # ------------------------------------------------ DDL / kaynak arama
+
+    def search_ddl(self):
+        if self.conn is None:
+            return
+        if self.busy:
+            self._set_status("Başka bir işlem çalışıyor, bitmesini bekleyin...")
+            return
+        term = self.ddl_search_var.get().strip()
+        if term in ("", DDL_SEARCH_PH):
+            return
+        scope = (sorted(self.selected_schemas) if self.selected_schemas
+                 else list(self.schemas))
+        if not scope:
+            return
+        if not self.selected_schemas and len(scope) > 5:
+            if not messagebox.askyesno(
+                    "Tüm şemalarda ara",
+                    f"Şema seçilmedi. Arama {len(scope)} şemanın tümünde "
+                    "yapılacak; büyük veritabanlarında yavaş olabilir.\n\n"
+                    "Devam edilsin mi?"):
+                return
+
+        self._set_status(f"DDL/kaynak aranıyor: '{term}' — {len(scope)} şema...")
+        self.ddl_btn.configure(state=tk.DISABLED)
+
+        def work(conn):
+            cur = conn.cursor()
+            like = "%" + term.upper() + "%"
+            results = []
+            # Oracle IN listesi 1000 ifade ile sınırlı — parça parça sorgula
+            for i in range(0, len(scope), 1000):
+                chunk = scope[i:i + 1000]
+                binds = {f"s{j}": s for j, s in enumerate(chunk)}
+                inlist = ",".join(":" + k for k in binds)
+                # PL/SQL kaynak nesneleri (procedure/function/package/trigger/type...)
+                cur.execute(
+                    f"SELECT owner, type, name, line, text FROM all_source "
+                    f"WHERE owner IN ({inlist}) AND UPPER(text) LIKE :q "
+                    f"ORDER BY owner, name, line",
+                    {**binds, "q": like})
+                for owner, typ, name, line, text in cur.fetchall():
+                    results.append((owner, typ, name, line,
+                                    (text or "").rstrip("\n")))
+                # View tanımları (text_vc, 12c+); yoksa sessizce atla
+                try:
+                    cur.execute(
+                        f"SELECT owner, view_name, text_vc FROM all_views "
+                        f"WHERE owner IN ({inlist}) AND UPPER(text_vc) LIKE :q "
+                        f"ORDER BY owner, view_name",
+                        {**binds, "q": like})
+                    for owner, name, text in cur.fetchall():
+                        results.append((owner, "VIEW", name, 1,
+                                        (text or "").strip()[:4000]))
+                except Exception:
+                    pass
+            cur.close()
+            return ("ddl_results", term, results)
+        self._run_in_thread(work)
+
+    def _show_ddl_results(self, term, results):
+        tab = self.new_tab(title=f"DDL: {term[:20]}")
+        tab.set_sql(
+            f"-- DDL/kaynak araması: '{term}' — {len(results)} eşleşme\n"
+            "-- Bir satıra çift tıklayın: nesnenin tam kaynağı yeni sekmede açılır")
+        cols = ["ŞEMA", "TİP", "NESNE", "SATIR", "METİN"]
+        tab.show_rows(cols, list(results))
+        tab.grid.bind("<Double-1>", lambda e: self._on_ddl_result_open(tab))
+        tab.grid.bind("<Return>", lambda e: self._on_ddl_result_open(tab))
+
+    def _on_ddl_result_open(self, tab):
+        sel = tab.grid.focus()
+        if not sel:
+            return
+        vals = tab.grid.item(sel, "values")
+        if not vals or len(vals) < 3:
+            return
+        self._open_object_ddl(vals[0], vals[1], vals[2])
+
+    def _open_object_ddl(self, owner, typ, name):
+        """DDL arama sonucundaki bir nesnenin tam kaynağını yeni sekmede aç."""
+        if self.conn is None or self.busy:
+            return
+        self._set_status(f"{owner}.{name} kaynağı getiriliyor...")
+
+        def work(conn):
+            cur = conn.cursor()
+            if typ == "VIEW":
+                cur.execute("SELECT text FROM all_views "
+                            "WHERE owner = :o AND view_name = :n", o=owner, n=name)
+                row = cur.fetchone()
+                body = row[0] if row else ""
+                ddl = (f'CREATE OR REPLACE VIEW "{owner}"."{name}" AS\n{body}')
+            else:
+                cur.execute("SELECT text FROM all_source "
+                            "WHERE owner = :o AND name = :n AND type = :t "
+                            "ORDER BY line", o=owner, n=name, t=typ)
+                lines = [r[0] for r in cur.fetchall()]
+                ddl = "CREATE OR REPLACE " + "".join(lines) if lines else ""
+            cur.close()
+            return ("object_ddl", owner, name, ddl)
+        self._run_in_thread(work)
+
     def _load_schema_objects(self, schema):
         self._set_status(f"{schema} şemasındaki nesneler yükleniyor...")
 
@@ -576,11 +791,13 @@ class OracleClientApp:
     def _render_tree(self):
         self.obj_tree.delete(*self.obj_tree.get_children())
         filt = self.filter_var.get().strip()
-        if filt == "Filtrele...":
+        if filt == OBJ_FILTER_PH:
             filt = ""
         filt = filt.upper()
 
         for schema in self.schemas:
+            if self.selected_schemas and schema not in self.selected_schemas:
+                continue
             objs = self.schema_objects.get(schema)
             if objs is None:
                 # henüz yüklenmemiş şema — filtre varsa şema adına uygula
@@ -998,6 +1215,8 @@ class OracleClientApp:
             self.disconnect_btn.configure(state=tk.NORMAL)
             self.run_btn.configure(state=tk.NORMAL)
             self.refresh_btn.configure(state=tk.NORMAL)
+            self.schema_btn.configure(state=tk.NORMAL)
+            self.ddl_btn.configure(state=tk.NORMAL)
             self._set_status(f"Bağlandı: {self.user_var.get()}@{self.host_var.get()}"
                              f":{self.port_var.get()}/{self.service_var.get()}")
             self.load_schemas()
@@ -1055,10 +1274,27 @@ class OracleClientApp:
             self.completions.update(cols)
             if show_popup and cols:
                 self._show_autocomplete(cols)
+        elif kind == "ddl_results":
+            self.busy = False
+            _, term, results = msg
+            if self.conn:
+                self.ddl_btn.configure(state=tk.NORMAL)
+            self._show_ddl_results(term, results)
+            self._set_status(f"DDL araması '{term}': {len(results)} eşleşme")
+            self._update_export_btn()
+        elif kind == "object_ddl":
+            self.busy = False
+            _, owner, name, ddl = msg
+            if ddl.strip():
+                self.new_tab(sql=ddl, title=name)
+                self._set_status(f"{owner}.{name} kaynağı açıldı")
+            else:
+                self._set_status(f"{owner}.{name} için kaynak bulunamadı")
         elif kind == "error":
             self.busy = False
             self.pending_loads = []
             self.run_btn.configure(state=tk.NORMAL if self.conn else tk.DISABLED)
+            self.ddl_btn.configure(state=tk.NORMAL if self.conn else tk.DISABLED)
             self._set_status("Hata")
             messagebox.showerror("Hata", msg[1])
 
