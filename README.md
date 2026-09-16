@@ -44,9 +44,15 @@ python3 oracle_client.py
 To get a double-clickable macOS application that bundles Python and all dependencies:
 
 ```bash
-pip3 install pyinstaller
-python3 -m PyInstaller --noconfirm --windowed --name "Oracle Client" oracle_client.py
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt pyinstaller
+.venv/bin/python -m PyInstaller --noconfirm --windowed --name "Oracle Client" \
+    --hidden-import cryptography --hidden-import getpass \
+    --hidden-import secrets --hidden-import ssl --hidden-import uuid \
+    oracle_client.py
 ```
+
+The `--hidden-import` flags matter: `oracledb`'s compiled core imports `cryptography` and several stdlib modules lazily, so PyInstaller misses them — without the flags the built app fails with `DPY-3016` or `No module named 'getpass'` when connecting.
 
 The app appears under `dist/Oracle Client.app` — drag it to your Desktop or `/Applications`.
 
