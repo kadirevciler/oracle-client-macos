@@ -20,6 +20,7 @@ Built with Python + Tkinter + [python-oracledb](https://oracle.github.io/python-
 - **Autocomplete / IntelliSense** — SQL keywords, schema names, table/view names, and column suggestions after typing `TABLE_NAME.` (Ctrl+Space to trigger manually)
 - **Query results grid** with horizontal/vertical scrolling (first 1000 rows for ad-hoc queries)
 - **CSV export** of the active tab's results (semicolon-separated, UTF-8 BOM — opens directly in Excel)
+- **HTML report** — one click turns the current result into a self-contained, offline report: summary cards, the SQL, a column profile (type, null/distinct counts, min/max/avg/sum for numeric columns), an auto-generated inline-SVG bar chart when a categorical + numeric column pair exists, and a styled data table; opens in your browser (no external libraries, works fully offline)
 - **Query history** — every executed query is kept with a timestamp, double-click to open it in a new tab (persists across restarts)
 - **Script files** — open (each in its own tab) and save `.sql` scripts (⌘S)
 - **Non-blocking UI** — queries run on a background thread
@@ -92,7 +93,7 @@ Fork it, open an issue, send a PR. Everything is in a single file ([oracle_clien
 
 macOS için basit ve hafif bir Oracle SQL istemcisi. Oracle Instant Client kurulumu gerektirmez; Python + Tkinter + python-oracledb (thin mode) ile doğrudan bağlanır.
 
-**Özellikler:** bağlantı profilleri, şema → tablo/görünüm ağacı (yenile düğmesiyle tazeleme; çift tık = yeni sekmede ilk 100 satır), **çok-seçimli şema filtresi** (aranabilir onay kutusu listesi), **DDL/kaynak içinde serbest metin arama** (seçili şemalarda view + PL/SQL kaynağı; sonuca çift tık = nesnenin tam kaynağı yeni sekmede), **sekmeli sorgular** (her sorgu kendi sekmesinde, bağımsız düzenlenip çalıştırılır — ⌘T yeni, ⌘W kapat), sözdizimi renklendirmeli SQL editörü, otomatik tamamlama (`TABLO.` yazınca kolon önerisi), CSV dışa aktarma, kalıcı sorgu tarihçesi, `.sql` betik aç/kaydet.
+**Özellikler:** bağlantı profilleri, şema → tablo/görünüm ağacı (yenile düğmesiyle tazeleme; çift tık = yeni sekmede ilk 100 satır), **çok-seçimli şema filtresi** (aranabilir onay kutusu listesi), **DDL/kaynak içinde serbest metin arama** (seçili şemalarda view + PL/SQL kaynağı; sonuca çift tık = nesnenin tam kaynağı yeni sekmede), **sekmeli sorgular** (her sorgu kendi sekmesinde, bağımsız düzenlenip çalıştırılır — ⌘T yeni, ⌘W kapat), sözdizimi renklendirmeli SQL editörü, otomatik tamamlama (`TABLO.` yazınca kolon önerisi), CSV dışa aktarma, **HTML rapor oluşturma** (özet kartları + SQL + kolon profili + otomatik SVG çubuk grafik + stillendirilmiş tablo; harici kütüphane yok, tarayıcıda çevrimdışı açılır), kalıcı sorgu tarihçesi, `.sql` betik aç/kaydet.
 
 **Kurulum:**
 

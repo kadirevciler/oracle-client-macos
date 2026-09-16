@@ -7,13 +7,16 @@ Gereksinim: pip3 install oracledb  (thin mode, Oracle Instant Client gerekmez)
 
 import base64
 import csv
+import decimal
+import html
 import json
 import os
 import queue
 import re
 import threading
 import time
-from datetime import datetime
+import webbrowser
+from datetime import date, datetime
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
@@ -65,6 +68,9 @@ class QueryTab:
         self.script_path = None
         self.last_columns = None
         self.last_rows = None
+        self.last_sql = ""
+        self.last_truncated = False
+        self.last_elapsed = None
 
         self.frame = ttk.Frame(notebook)
         paned = ttk.PanedWindow(self.frame, orient=tk.VERTICAL)
@@ -227,6 +233,7 @@ class OracleClientApp:
         tab = self.current_tab() if self.tabs else None
         state = tk.NORMAL if tab and tab.last_columns else tk.DISABLED
         self.export_btn.configure(state=state)
+        self.report_btn.configure(state=state)
 
     # ------------------------------------------------------------------ UI
 
@@ -368,6 +375,9 @@ class OracleClientApp:
         self.export_btn = ttk.Button(toolbar, text="⬇ CSV'ye Aktar",
                                      command=self.export_csv, state=tk.DISABLED)
         self.export_btn.pack(side=tk.LEFT, padx=2)
+        self.report_btn = ttk.Button(toolbar, text="📊 Rapor Oluştur",
+                                     command=self.generate_report, state=tk.DISABLED)
+        self.report_btn.pack(side=tk.LEFT, padx=2)
 
         self.query_nb = ttk.Notebook(right)
         self.query_nb.pack(fill=tk.BOTH, expand=True)
@@ -737,6 +747,8 @@ class OracleClientApp:
             "-- Bir satıra çift tıklayın: nesnenin tam kaynağı yeni sekmede açılır")
         cols = ["ŞEMA", "TİP", "NESNE", "SATIR", "METİN"]
         tab.show_rows(cols, list(results))
+        tab.last_sql = f"-- DDL/kaynak araması: '{term}'"
+        tab.last_truncated = False
         tab.grid.bind("<Double-1>", lambda e: self._on_ddl_result_open(tab))
         tab.grid.bind("<Return>", lambda e: self._on_ddl_result_open(tab))
 
@@ -885,6 +897,7 @@ class OracleClientApp:
         if not sql:
             return
         self._add_history(sql)
+        tab.last_sql = sql
         self._set_status(f"[{tab.title}] Sorgu çalışıyor...")
         self.run_btn.configure(state=tk.DISABLED)
 
@@ -927,6 +940,251 @@ class OracleClientApp:
             self._set_status(f"{len(tab.last_rows)} satır CSV'ye aktarıldı: {path}")
         except OSError as exc:
             messagebox.showerror("CSV hatası", str(exc))
+
+    # -------------------------------------------------------- HTML rapor
+
+    def generate_report(self):
+        tab = self.current_tab()
+        if not tab.last_columns:
+            return
+        default = re.sub(r"[^0-9A-Za-z_-]+", "_", tab.title).strip("_") or "rapor"
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = filedialog.asksaveasfilename(
+            title="Raporu kaydet", defaultextension=".html",
+            filetypes=[("HTML rapor", "*.html"), ("Tüm dosyalar", "*.*")],
+            initialfile=f"{default}_{stamp}.html", parent=self.root)
+        if not path:
+            return
+        try:
+            html_text = self._build_report_html(tab)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(html_text)
+        except OSError as exc:
+            messagebox.showerror("Rapor hatası", str(exc))
+            return
+        self._set_status(f"Rapor oluşturuldu: {path}")
+        try:
+            webbrowser.open(f"file://{path}")
+        except Exception:
+            pass
+
+    @staticmethod
+    def _is_number(v):
+        return isinstance(v, (int, float, decimal.Decimal)) and not isinstance(v, bool)
+
+    def _column_stats(self, columns, rows):
+        """Her kolon için tip tahmini ve temel istatistikler."""
+        stats = []
+        n = len(rows)
+        for i, col in enumerate(columns):
+            values = [r[i] for r in rows]
+            non_null = [v for v in values if v is not None]
+            nulls = n - len(non_null)
+            try:
+                distinct = len({v for v in non_null})
+            except TypeError:
+                distinct = len({str(v) for v in non_null})
+
+            info = {"name": col, "nulls": nulls, "distinct": distinct,
+                    "type": "metin"}
+            if non_null and all(self._is_number(v) for v in non_null):
+                nums = [float(v) for v in non_null]
+                total = sum(nums)
+                info.update(type="sayı", min=min(nums), max=max(nums),
+                            avg=total / len(nums), sum=total)
+            elif non_null and all(isinstance(v, (date, datetime)) for v in non_null):
+                info.update(type="tarih", min=min(non_null), max=max(non_null))
+            stats.append(info)
+        return stats
+
+    def _pick_chart(self, columns, rows, stats):
+        """Kategorik + sayısal kolon çifti bulup (etiket, değer) listesi üret."""
+        cat_idx = num_idx = None
+        for i, s in enumerate(stats):
+            if s["type"] == "metin" and 1 < s["distinct"] <= 30 and cat_idx is None:
+                cat_idx = i
+            if s["type"] == "sayı" and num_idx is None:
+                num_idx = i
+        if cat_idx is None or num_idx is None:
+            return None
+        agg = {}
+        for r in rows:
+            key = r[cat_idx]
+            val = r[num_idx]
+            if key is None or not self._is_number(val):
+                continue
+            agg[str(key)] = agg.get(str(key), 0.0) + float(val)
+        if not agg:
+            return None
+        top = sorted(agg.items(), key=lambda kv: kv[1], reverse=True)[:15]
+        return {"label": columns[cat_idx], "measure": columns[num_idx], "data": top}
+
+    @staticmethod
+    def _fmt(v):
+        if v is None:
+            return ""
+        if isinstance(v, bool):
+            return str(v)
+        if isinstance(v, float):
+            s = f"{v:,.2f}"
+        elif isinstance(v, (int, decimal.Decimal)):
+            s = f"{v:,}"
+        else:
+            return str(v)
+        # US biçimi (,/.) -> TR biçimi (./,)
+        return s.replace(",", "\x1f").replace(".", ",").replace("\x1f", ".")
+
+    def _svg_bar_chart(self, chart):
+        data = chart["data"]
+        if not data:
+            return ""
+        maxv = max(v for _, v in data) or 1
+        bar_h, gap, label_w, chart_w = 26, 8, 200, 460
+        height = len(data) * (bar_h + gap) + gap
+        rows_svg = []
+        for idx, (label, val) in enumerate(data):
+            y = gap + idx * (bar_h + gap)
+            w = max(1, int((val / maxv) * chart_w))
+            lbl = html.escape(label[:28])
+            valtxt = html.escape(self._fmt(val))
+            rows_svg.append(
+                f'<text x="{label_w - 8}" y="{y + bar_h * 0.68}" '
+                f'text-anchor="end" class="bl">{lbl}</text>'
+                f'<rect x="{label_w}" y="{y}" width="{w}" height="{bar_h}" '
+                f'rx="3" class="bar"/>'
+                f'<text x="{label_w + w + 6}" y="{y + bar_h * 0.68}" '
+                f'class="bv">{valtxt}</text>')
+        total_w = label_w + chart_w + 90
+        return (
+            f'<svg viewBox="0 0 {total_w} {height}" width="100%" '
+            f'style="max-width:{total_w}px" xmlns="http://www.w3.org/2000/svg">'
+            + "".join(rows_svg) + "</svg>")
+
+    def _build_report_html(self, tab):
+        columns = tab.last_columns
+        rows = tab.last_rows
+        stats = self._column_stats(columns, rows)
+        chart = self._pick_chart(columns, rows, stats)
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        conn_info = ""
+        if self.conn is not None:
+            conn_info = (f"{html.escape(self.user_var.get())}@"
+                         f"{html.escape(self.host_var.get())}:"
+                         f"{html.escape(self.port_var.get())}/"
+                         f"{html.escape(self.service_var.get())}")
+
+        # Özet kartları
+        cards = [("Satır", f"{len(rows):,}" + (" (ilk 1000)" if tab.last_truncated else "")),
+                 ("Kolon", str(len(columns)))]
+        if tab.last_elapsed is not None:
+            cards.append(("Süre", f"{tab.last_elapsed:.2f} sn"))
+        cards_html = "".join(
+            f'<div class="card"><div class="cv">{html.escape(v)}</div>'
+            f'<div class="cl">{html.escape(l)}</div></div>' for l, v in cards)
+
+        # Kolon profili
+        prof_rows = []
+        for s in stats:
+            extra = ""
+            if s["type"] == "sayı":
+                extra = (f'min {self._fmt(s["min"])} · maks {self._fmt(s["max"])} · '
+                         f'ort {self._fmt(s["avg"])} · top {self._fmt(s["sum"])}')
+            elif s["type"] == "tarih":
+                extra = f'{self._fmt(s["min"])} → {self._fmt(s["max"])}'
+            prof_rows.append(
+                f'<tr><td>{html.escape(s["name"])}</td>'
+                f'<td><span class="tag t-{s["type"]}">{s["type"]}</span></td>'
+                f'<td class="num">{s["nulls"]:,}</td>'
+                f'<td class="num">{s["distinct"]:,}</td>'
+                f'<td class="mut">{html.escape(extra)}</td></tr>')
+        prof_html = "".join(prof_rows)
+
+        # Grafik bölümü
+        chart_html = ""
+        if chart:
+            chart_html = (
+                f'<h2>Grafik</h2><p class="mut">{html.escape(chart["measure"])} '
+                f'toplamı, {html.escape(chart["label"])} bazında (ilk 15)</p>'
+                f'<div class="chart">{self._svg_bar_chart(chart)}</div>')
+
+        # Veri tablosu
+        head = "".join(f"<th>{html.escape(c)}</th>" for c in columns)
+        body_rows = []
+        for r in rows:
+            tds = []
+            for v in r:
+                cls = ' class="num"' if self._is_number(v) else ""
+                cell = "<span class='null'>NULL</span>" if v is None \
+                    else html.escape(self._fmt(v) if isinstance(v, (float, decimal.Decimal))
+                                     else str(v))
+                tds.append(f"<td{cls}>{cell}</td>")
+            body_rows.append("<tr>" + "".join(tds) + "</tr>")
+        body_html = "".join(body_rows)
+
+        sql_html = html.escape(tab.last_sql or "")
+        title = html.escape(tab.title)
+
+        return f"""<!DOCTYPE html>
+<html lang="tr"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rapor — {title}</title>
+<style>
+:root {{ --bg:#f6f7f9; --fg:#1f2328; --mut:#6b7280; --card:#fff;
+  --border:#e5e7eb; --accent:#0b6bcb; --bar:#0b6bcb; }}
+* {{ box-sizing:border-box; }}
+body {{ margin:0; background:var(--bg); color:var(--fg);
+  font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; }}
+.wrap {{ max-width:1100px; margin:0 auto; padding:28px 20px 60px; }}
+header h1 {{ margin:0 0 4px; font-size:22px; }}
+header .meta {{ color:var(--mut); font-size:13px; }}
+.cards {{ display:flex; gap:12px; flex-wrap:wrap; margin:20px 0; }}
+.card {{ background:var(--card); border:1px solid var(--border); border-radius:10px;
+  padding:14px 18px; min-width:120px; }}
+.cv {{ font-size:22px; font-weight:600; }}
+.cl {{ color:var(--mut); font-size:12px; text-transform:uppercase;
+  letter-spacing:.04em; }}
+h2 {{ font-size:16px; margin:28px 0 10px; }}
+pre.sql {{ background:#0d1117; color:#e6edf3; padding:14px 16px; border-radius:10px;
+  overflow:auto; font:12.5px/1.5 Menlo,Consolas,monospace; white-space:pre-wrap; }}
+table {{ border-collapse:collapse; width:100%; background:var(--card);
+  border:1px solid var(--border); border-radius:10px; overflow:hidden; }}
+th,td {{ padding:7px 10px; text-align:left; border-bottom:1px solid var(--border);
+  font-size:13px; white-space:nowrap; }}
+th {{ background:#eef1f5; position:sticky; top:0; font-weight:600; }}
+tr:nth-child(even) td {{ background:#fafbfc; }}
+td.num {{ text-align:right; font-variant-numeric:tabular-nums; }}
+.null {{ color:#c026d3; font-style:italic; font-size:12px; }}
+.mut {{ color:var(--mut); }}
+.tag {{ padding:2px 8px; border-radius:20px; font-size:11px; font-weight:600; }}
+.t-sayı {{ background:#e0f2fe; color:#0369a1; }}
+.t-metin {{ background:#f1f5f9; color:#475569; }}
+.t-tarih {{ background:#dcfce7; color:#15803d; }}
+.tablewrap {{ overflow:auto; max-height:70vh; border-radius:10px; }}
+.chart {{ background:var(--card); border:1px solid var(--border);
+  border-radius:10px; padding:16px; overflow:auto; }}
+.chart text {{ font:12px -apple-system,sans-serif; fill:var(--fg); }}
+.chart .bl {{ fill:#475569; }}
+.chart .bv {{ fill:#475569; font-variant-numeric:tabular-nums; }}
+.chart .bar {{ fill:var(--bar); }}
+footer {{ margin-top:30px; color:var(--mut); font-size:12px; }}
+</style></head><body><div class="wrap">
+<header>
+  <h1>{title}</h1>
+  <div class="meta">Oracle Client raporu · {html.escape(now)}
+  {(' · ' + conn_info) if conn_info else ''}</div>
+</header>
+<div class="cards">{cards_html}</div>
+<h2>Sorgu</h2>
+<pre class="sql">{sql_html}</pre>
+<h2>Kolon Profili</h2>
+<table><thead><tr><th>Kolon</th><th>Tip</th><th>Boş (null)</th>
+<th>Tekil</th><th>İstatistik</th></tr></thead><tbody>{prof_html}</tbody></table>
+{chart_html}
+<h2>Veri ({len(rows):,} satır)</h2>
+<div class="tablewrap"><table><thead><tr>{head}</tr></thead>
+<tbody>{body_html}</tbody></table></div>
+<footer>Oracle Client · github.com/kadirevciler/oracle-client-macos</footer>
+</div></body></html>"""
 
     # ---------------------------------------------------- Betik aç/kaydet
 
@@ -1253,6 +1511,8 @@ class OracleClientApp:
             _, tab, columns, rows, truncated, elapsed = msg
             if tab in self.tabs:
                 tab.show_rows(columns, rows)
+                tab.last_truncated = truncated
+                tab.last_elapsed = elapsed
                 self.completions.update(columns)
             note = f" (ilk {MAX_QUERY_ROWS} satır gösteriliyor)" if truncated else ""
             self._set_status(f"[{tab.title}] {len(rows)} satır — {elapsed:.2f} sn{note}")
